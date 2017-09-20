@@ -42,13 +42,19 @@ MIMETYPES = {
     "VADDRESSBOOK": "text/vcard",
     "VCALENDAR": "text/calendar"}
 
+OBJECT_MIMETYPES = {
+    "VCARD": "text/vcard",
+    "VLIST": "text/x-vlist",
+    "VCALENDAR": "text/calendar"}
+
 NAMESPACES = {
     "C": "urn:ietf:params:xml:ns:caldav",
     "CR": "urn:ietf:params:xml:ns:carddav",
     "D": "DAV:",
     "CS": "http://calendarserver.org/ns/",
     "ICAL": "http://apple.com/ns/ical/",
-    "ME": "http://me.com/_namespace/"}
+    "ME": "http://me.com/_namespace/",
+    "RADICALE": "http://radicale.org/ns/"}
 
 NAMESPACES_REV = {}
 for short, url in NAMESPACES.items():
@@ -56,7 +62,7 @@ for short, url in NAMESPACES.items():
     ET.register_namespace("" if short == "D" else short, url)
 
 CLARK_TAG_REGEX = re.compile(r"{(?P<namespace>[^}]*)}(?P<tag>.*)", re.VERBOSE)
-HUMAN_REGEX = re.compile(r"(?P<namespace>[^:{}]*)(?P<tag>.*)", re.VERBOSE)
+HUMAN_REGEX = re.compile(r"(?P<namespace>[^:{}]*):(?P<tag>.*)", re.VERBOSE)
 
 DAY = timedelta(days=1)
 SECOND = timedelta(seconds=1)
@@ -148,81 +154,92 @@ def _date_to_datetime(date_):
     return date_
 
 
-def _comp_match(item, filter_, scope="collection"):
+def _comp_match(item, filter_, level=0):
     """Check whether the ``item`` matches the comp ``filter_``.
 
-    If ``scope`` is ``"collection"``, the filter is applied on the
+    If ``level`` is ``0``, the filter is applied on the
     item's collection. Otherwise, it's applied on the item.
 
     See rfc4791-9.7.1.
 
     """
-    filter_length = len(filter_)
-    if scope == "collection":
-        tag = item.collection.get_meta("tag")
+
+    # TODO: Filtering VALARM and VFREEBUSY is not implemented
+    # HACK: the filters are tested separately against all components
+
+    if level == 0:
+        tag = item.name
+    elif level == 1:
+        tag = item.component_name
     else:
-        for component in item.components():
-            if component.name in ("VTODO", "VEVENT", "VJOURNAL"):
-                tag = component.name
-                break
-        else:
-            return False
-    if filter_length == 0:
+        item.collection.logger.warning(
+            "Filters with three levels of comp-filter are not supported")
+        return True
+    if not tag:
+        return False
+    name = filter_.get("name").upper()
+    if len(filter_) == 0:
         # Point #1 of rfc4791-9.7.1
-        return filter_.get("name") == tag
-    else:
-        if filter_length == 1:
-            if filter_[0].tag == _tag("C", "is-not-defined"):
-                # Point #2 of rfc4791-9.7.1
-                return filter_.get("name") != tag
-        if filter_[0].tag == _tag("C", "time-range"):
-            # Point #3 of rfc4791-9.7.1
+        return name == tag
+    if len(filter_) == 1:
+        if filter_[0].tag == _tag("C", "is-not-defined"):
+            # Point #2 of rfc4791-9.7.1
+            return name != tag
+    if name != tag:
+        return False
+    if (level == 0 and name != "VCALENDAR" or
+            level == 1 and name not in ("VTODO", "VEVENT", "VJOURNAL")):
+        item.collection.logger.warning("Filtering %s is not supported" % name)
+        return True
+    # Point #3 and #4 of rfc4791-9.7.1
+    components = ([item.item] if level == 0
+                  else list(getattr(item, "%s_list" % tag.lower())))
+    for child in filter_:
+        if child.tag == _tag("C", "prop-filter"):
+            if not any(_prop_match(comp, child, "C")
+                       for comp in components):
+                return False
+        elif child.tag == _tag("C", "time-range"):
             if not _time_range_match(item.item, filter_[0], tag):
                 return False
-            filter_ = filter_[1:]
-        # Point #4 of rfc4791-9.7.1
-        return all(
-            _prop_match(item, child) if child.tag == _tag("C", "prop-filter")
-            else _comp_match(item, child, scope="component")
-            for child in filter_)
+        elif child.tag == _tag("C", "comp-filter"):
+            if not _comp_match(item, child, level=level + 1):
+                return False
+        else:
+            raise ValueError("Unexpected %r in comp-filter" % child.tag)
+    return True
 
 
-def _prop_match(item, filter_):
+def _prop_match(vobject_item, filter_, ns):
     """Check whether the ``item`` matches the prop ``filter_``.
 
     See rfc4791-9.7.2 and rfc6352-10.5.1.
 
     """
-    filter_length = len(filter_)
-    if item.collection.get_meta("tag") == "VCALENDAR":
-        for component in item.components():
-            if component.name in ("VTODO", "VEVENT", "VJOURNAL"):
-                vobject_item = component
-                break
-    else:
-        vobject_item = item.item
-    if filter_length == 0:
+    name = filter_.get("name").lower()
+    if len(filter_) == 0:
         # Point #1 of rfc4791-9.7.2
-        return filter_.get("name").lower() in vobject_item.contents
-    else:
-        name = filter_.get("name").lower()
-        if filter_length == 1:
-            if filter_[0].tag == _tag("C", "is-not-defined"):
-                # Point #2 of rfc4791-9.7.2
-                return name not in vobject_item.contents
-        if filter_[0].tag == _tag("C", "time-range"):
-            # Point #3 of rfc4791-9.7.2
-            if not _time_range_match(vobject_item, filter_[0], name):
+        return name in vobject_item.contents
+    if len(filter_) == 1:
+        if filter_[0].tag == _tag("C", "is-not-defined"):
+            # Point #2 of rfc4791-9.7.2
+            return name not in vobject_item.contents
+    if name not in vobject_item.contents:
+        return False
+    # Point #3 and #4 of rfc4791-9.7.2
+    for child in filter_:
+        if ns == "C" and child.tag == _tag("C", "time-range"):
+            if not _time_range_match(vobject_item, child, name):
                 return False
-            filter_ = filter_[1:]
-        elif filter_[0].tag == _tag("C", "text-match"):
-            # Point #4 of rfc4791-9.7.2
-            if not _text_match(vobject_item, filter_[0], name):
+        elif child.tag == _tag(ns, "text-match"):
+            if not _text_match(vobject_item, child, name, ns):
                 return False
-            filter_ = filter_[1:]
-        return all(
-            _param_filter_match(vobject_item, param_filter, name)
-            for param_filter in filter_)
+        elif child.tag == _tag(ns, "param-filter"):
+            if not _param_filter_match(vobject_item, child, name, ns):
+                return False
+        else:
+            raise ValueError("Unexpected %r in prop-filter" % child.tag)
+    return True
 
 
 def _time_range_match(vobject_item, filter_, child_name):
@@ -246,12 +263,12 @@ def _time_range_match(vobject_item, filter_, child_name):
 
     matched = False
 
-    def range_fn(range_start, range_end, recurrence):
+    def range_fn(range_start, range_end, is_recurrence):
         nonlocal matched
         if start < range_end and range_start < end:
             matched = True
             return True
-        if end < range_start and not recurrence:
+        if end < range_start and not is_recurrence:
             return True
         return False
 
@@ -267,7 +284,7 @@ def _visit_time_ranges(vobject_item, child_name, range_fn, infinity_fn):
     `vobject_item`` with visitors ``range_fn`` and ``infinity_fn``.
 
     ``range_fn`` gets called for every time_range with ``start`` and ``end``
-    datetimes and ``recurrence`` as arguments. If the function returns True,
+    datetimes and ``is_recurrence`` as arguments. If the function returns True,
     the operation is cancelled.
 
     ``infinity_fn`` gets called when an infiite recurrence rule is detected
@@ -282,8 +299,6 @@ def _visit_time_ranges(vobject_item, child_name, range_fn, infinity_fn):
     # with Recurrence ID affects the recurrence itself and all following
     # recurrences too. This is not respected and client don't seem to bother
     # either.
-
-    child = getattr(vobject_item, child_name.lower())
 
     def getrruleset(child, ignore=()):
         if (hasattr(child, "rrule") and
@@ -312,11 +327,13 @@ def _visit_time_ranges(vobject_item, child_name, range_fn, infinity_fn):
                 if main is not None:
                     raise ValueError("Multiple main components")
                 main = comp
+        if main is None:
+            raise ValueError("Main component missing")
         yield main, False, recurrences
 
     # Comments give the lines in the tables of the specification
     if child_name == "VEVENT":
-        for child, recurrence, recurrences in get_children(
+        for child, is_recurrence, recurrences in get_children(
                 vobject_item.vevent_list):
             # TODO: check if there's a timezone
             dtstart = child.dtstart.value
@@ -345,30 +362,31 @@ def _visit_time_ranges(vobject_item, child_name, range_fn, infinity_fn):
                 if dtend is not None:
                     # Line 1
                     dtend = dtstart + timedelta(seconds=original_duration)
-                    if range_fn(dtstart, dtend, recurrence):
+                    if range_fn(dtstart, dtend, is_recurrence):
                         return
                 elif duration is not None:
                     if original_duration is None:
                         original_duration = duration.seconds
                     if duration.seconds > 0:
                         # Line 2
-                        if range_fn(dtstart, dtstart + duration, recurrence):
+                        if range_fn(dtstart, dtstart + duration,
+                                    is_recurrence):
                             return
                     else:
                         # Line 3
-                        if range_fn(dtstart, dtstart + SECOND, recurrence):
+                        if range_fn(dtstart, dtstart + SECOND, is_recurrence):
                             return
                 elif dtstart_is_datetime:
                     # Line 4
-                    if range_fn(dtstart, dtstart + SECOND, recurrence):
+                    if range_fn(dtstart, dtstart + SECOND, is_recurrence):
                         return
                 else:
                     # Line 5
-                    if range_fn(dtstart, dtstart + DAY, recurrence):
+                    if range_fn(dtstart, dtstart + DAY, is_recurrence):
                         return
 
     elif child_name == "VTODO":
-        for child, recurrence, recurrences in get_children(
+        for child, is_recurrence, recurrences in get_children(
                 vobject_item.vtodo_list):
             dtstart = getattr(child, "dtstart", None)
             duration = getattr(child, "duration", None)
@@ -407,7 +425,7 @@ def _visit_time_ranges(vobject_item, child_name, range_fn, infinity_fn):
                     reference_dates = (created,)
                 else:
                     # Line 8
-                    if range_fn(DATETIME_MIN, DATETIME_MAX, recurrence):
+                    if range_fn(DATETIME_MIN, DATETIME_MAX, is_recurrence):
                         return
                     reference_dates = ()
 
@@ -418,30 +436,30 @@ def _visit_time_ranges(vobject_item, child_name, range_fn, infinity_fn):
                     # Line 1
                     if range_fn(reference_date,
                                 reference_date + duration + SECOND,
-                                recurrence):
+                                is_recurrence):
                         return
                     if range_fn(reference_date + duration - SECOND,
                                 reference_date + duration + SECOND,
-                                recurrence):
+                                is_recurrence):
                         return
                 elif dtstart is not None and due is not None:
                     # Line 2
                     due = reference_date + timedelta(seconds=original_duration)
-                    if (range_fn(reference_date, due, recurrence) or
+                    if (range_fn(reference_date, due, is_recurrence) or
                             range_fn(reference_date,
-                                     reference_date + SECOND, recurrence) or
-                            range_fn(due - SECOND, due, recurrence) or
+                                     reference_date + SECOND, is_recurrence) or
+                            range_fn(due - SECOND, due, is_recurrence) or
                             range_fn(due - SECOND, reference_date + SECOND,
-                                     recurrence)):
+                                     is_recurrence)):
                         return
                 elif dtstart is not None:
                     if range_fn(reference_date, reference_date + SECOND,
-                                recurrence):
+                                is_recurrence):
                         return
                 elif due is not None:
                     # Line 4
                     if range_fn(reference_date - SECOND, reference_date,
-                                recurrence):
+                                is_recurrence):
                         return
                 elif completed is not None and created is not None:
                     # Line 5
@@ -449,26 +467,26 @@ def _visit_time_ranges(vobject_item, child_name, range_fn, infinity_fn):
                         seconds=original_duration)
                     if (range_fn(reference_date - SECOND,
                                  reference_date + SECOND,
-                                 recurrence) or
+                                 is_recurrence) or
                             range_fn(completed - SECOND, completed + SECOND,
-                                     recurrence) or
+                                     is_recurrence) or
                             range_fn(reference_date - SECOND,
-                                     reference_date + SECOND, recurrence) or
+                                     reference_date + SECOND, is_recurrence) or
                             range_fn(completed - SECOND, completed + SECOND,
-                                     recurrence)):
+                                     is_recurrence)):
                         return
                 elif completed is not None:
                     # Line 6
                     if range_fn(reference_date - SECOND,
-                                reference_date + SECOND, recurrence):
+                                reference_date + SECOND, is_recurrence):
                                 return
                 elif created is not None:
                     # Line 7
-                    if range_fn(reference_date, DATETIME_MAX, recurrence):
+                    if range_fn(reference_date, DATETIME_MAX, is_recurrence):
                         return
 
     elif child_name == "VJOURNAL":
-        for child, recurrence, recurrences in get_children(
+        for child, is_recurrence, recurrences in get_children(
                 vobject_item.vjournal_list):
             dtstart = getattr(child, "dtstart", None)
 
@@ -487,22 +505,23 @@ def _visit_time_ranges(vobject_item, child_name, range_fn, infinity_fn):
 
                     if dtstart_is_datetime:
                         # Line 1
-                        if range_fn(dtstart, dtstart + SECOND, recurrence):
+                        if range_fn(dtstart, dtstart + SECOND, is_recurrence):
                             return
                     else:
                         # Line 2
-                        if range_fn(dtstart, dtstart + DAY, recurrence):
+                        if range_fn(dtstart, dtstart + DAY, is_recurrence):
                             return
 
-    elif isinstance(child, date):
-        if range_fn(child, child + DAY, False):
-            return
-    elif isinstance(child, datetime):
-        if range_fn(child, child + SECOND, False):
-            return
+    else:
+        # Match a property
+        child = getattr(vobject_item, child_name.lower())
+        if isinstance(child, date):
+            range_fn(child, child + DAY, False)
+        elif isinstance(child, datetime):
+            range_fn(child, child + SECOND, False)
 
 
-def _text_match(vobject_item, filter_, child_name, attrib_name=None):
+def _text_match(vobject_item, filter_, child_name, ns, attrib_name=None):
     """Check whether the ``item`` matches the text-match ``filter_``.
 
     See rfc4791-9.7.5.
@@ -511,40 +530,56 @@ def _text_match(vobject_item, filter_, child_name, attrib_name=None):
     # TODO: collations are not supported, but the default ones needed
     # for DAV servers are actually pretty useless. Texts are lowered to
     # be case-insensitive, almost as the "i;ascii-casemap" value.
-    match = next(filter_.itertext()).lower()
+    text = next(filter_.itertext()).lower()
+    match_type = "contains"
+    if ns == "CR":
+        match_type = filter_.get("match-type", match_type)
+
+    def match(value):
+        value = value.lower()
+        if match_type == "equals":
+            return value == text
+        if match_type == "contains":
+            return text in value
+        if match_type == "starts-with":
+            return value.startswith(text)
+        if match_type == "ends-with":
+            return value.endswith(text)
+        raise ValueError("Unexpected text-match match-type: %r" % match_type)
+
     children = getattr(vobject_item, "%s_list" % child_name, [])
     if attrib_name:
         condition = any(
-            match in attrib.lower() for child in children
+            match(attrib) for child in children
             for attrib in child.params.get(attrib_name, []))
     else:
-        condition = any(match in child.value.lower() for child in children)
+        condition = any(match(child.value) for child in children)
     if filter_.get("negate-condition") == "yes":
         return not condition
     else:
         return condition
 
 
-def _param_filter_match(vobject_item, filter_, parent_name):
+def _param_filter_match(vobject_item, filter_, parent_name, ns):
     """Check whether the ``item`` matches the param-filter ``filter_``.
 
     See rfc4791-9.7.3.
 
     """
-    name = filter_.get("name")
+    name = filter_.get("name").upper()
     children = getattr(vobject_item, "%s_list" % parent_name, [])
     condition = any(name in child.params for child in children)
     if len(filter_):
-        if filter_[0].tag == _tag("C", "text-match"):
+        if filter_[0].tag == _tag(ns, "text-match"):
             return condition and _text_match(
-                vobject_item, filter_[0], parent_name, name)
-        elif filter_[0].tag == _tag("C", "is-not-defined"):
+                vobject_item, filter_[0], parent_name, ns, name)
+        elif filter_[0].tag == _tag(ns, "is-not-defined"):
             return not condition
     else:
         return condition
 
 
-def simplify_prefilters(filters):
+def simplify_prefilters(filters, collection_tag="VCALENDAR"):
     """Creates a simplified condition from ``filters``.
 
     Returns a tuple (``tag``, ``start``, ``end``, ``simple``) where ``tag`` is
@@ -556,8 +591,11 @@ def simplify_prefilters(filters):
     flat_filters = tuple(chain.from_iterable(filters))
     simple = len(flat_filters) <= 1
     for col_filter in flat_filters:
+        if collection_tag != "VCALENDAR":
+            simple = False
+            break
         if (col_filter.tag != _tag("C", "comp-filter") or
-                col_filter.get("name") != "VCALENDAR"):
+                col_filter.get("name").upper() != "VCALENDAR"):
             simple = False
             continue
         simple &= len(col_filter) <= 1
@@ -565,13 +603,15 @@ def simplify_prefilters(filters):
             if comp_filter.tag != _tag("C", "comp-filter"):
                 simple = False
                 continue
-            tag = comp_filter.get("name")
-            if (tag not in ("VTODO", "VEVENT", "VJOURNAL") or comp_filter.find(
-                    _tag("C", "is-not-defined")) is not None):
+            tag = comp_filter.get("name").upper()
+            if comp_filter.find(_tag("C", "is-not-defined")) is not None:
                 simple = False
                 continue
             simple &= len(comp_filter) <= 1
             for time_filter in comp_filter:
+                if tag not in ("VTODO", "VEVENT", "VJOURNAL"):
+                    simple = False
+                    break
                 if time_filter.tag != _tag("C", "time-range"):
                     simple = False
                     continue
@@ -594,11 +634,23 @@ def simplify_prefilters(filters):
     return None, TIMESTAMP_MIN, TIMESTAMP_MAX, simple
 
 
+def get_content_type(item):
+    """Get the content-type of an item with charset and component parameters.
+    """
+    mimetype = OBJECT_MIMETYPES[item.name]
+    encoding = item.collection.configuration.get("encoding", "request")
+    tag = item.component_name
+    content_type = "%s;charset=%s" % (mimetype, encoding)
+    if tag:
+        content_type += ";component=%s" % tag
+    return content_type
+
+
 def find_tag(vobject_item):
     """Find tag from ``vobject_item``."""
     if vobject_item.name == "VCALENDAR":
         for component in vobject_item.components():
-            if component.name in ("VTODO", "VEVENT", "VJOURNAL"):
+            if component.name != "VTIMEZONE":
                 return component.name
     return None
 
@@ -617,7 +669,7 @@ def find_tag_and_time_range(vobject_item):
         return (None, TIMESTAMP_MIN, TIMESTAMP_MAX)
     start = end = None
 
-    def range_fn(range_start, range_end, recurrence):
+    def range_fn(range_start, range_end, is_recurrence):
         nonlocal start, end
         if start is None or range_start < start:
             start = range_start
@@ -727,18 +779,12 @@ def propfind(base_prefix, path, xml_request, read_collections,
                ET.Element(_tag("D", "allprop")))
 
     props = ()
+    allprop = False
+    propname = False
     if top_tag.tag == _tag("D", "allprop"):
-        props = [
-            _tag("D", "getcontenttype"),
-            _tag("D", "resourcetype"),
-            _tag("D", "displayname"),
-            _tag("D", "owner"),
-            _tag("D", "getetag"),
-            _tag("ICAL", "calendar-color"),
-            _tag("CS", "getctag"),
-            _tag("C", "supported-calendar-component-set"),
-            _tag("D", "supported-report-set"),
-        ]
+        allprop = True
+    elif top_tag.tag == _tag("D", "propname"):
+        propname = True
     elif top_tag.tag == _tag("D", "prop"):
         props = [prop.tag for prop in top_tag]
 
@@ -754,25 +800,17 @@ def propfind(base_prefix, path, xml_request, read_collections,
     collections = []
     for collection in write_collections:
         collections.append(collection)
-        if top_tag.tag == _tag("D", "propname"):
-            response = _propfind_response(
-                base_prefix, path, collection, (), user, write=True,
-                propnames=True)
-        else:
-            response = _propfind_response(
-                base_prefix, path, collection, props, user, write=True)
+        response = _propfind_response(
+            base_prefix, path, collection, props, user, write=True,
+            allprop=allprop, propname=propname)
         if response:
             multistatus.append(response)
     for collection in read_collections:
         if collection in collections:
             continue
-        if top_tag.tag == _tag("D", "propname"):
-            response = _propfind_response(
-                base_prefix, path, collection, (), user, write=False,
-                propnames=True)
-        else:
-            response = _propfind_response(
-                base_prefix, path, collection, props, user, write=False)
+        response = _propfind_response(
+            base_prefix, path, collection, props, user, write=False,
+            allprop=allprop, propname=propname)
         if response:
             multistatus.append(response)
 
@@ -780,8 +818,10 @@ def propfind(base_prefix, path, xml_request, read_collections,
 
 
 def _propfind_response(base_prefix, path, item, props, user, write=False,
-                       propnames=False):
+                       propname=False, allprop=False):
     """Build and return a PROPFIND response."""
+    if propname and allprop or (props and (propname or allprop)):
+        raise ValueError("Only use one of props, propname and allprops")
     is_collection = isinstance(item, storage.BaseCollection)
     if is_collection:
         is_leaf = item.get_meta("tag") in ("VADDRESSBOOK", "VCALENDAR")
@@ -811,43 +851,62 @@ def _propfind_response(base_prefix, path, item, props, user, write=False,
     prop404 = ET.Element(_tag("D", "prop"))
     propstat404.append(prop404)
 
-    if propnames:
+    if propname or allprop:
+        props = []
         # Should list all properties that can be retrieved by the code below
-        prop200.append(ET.Element(_tag("D", "getetag")))
-        prop200.append(ET.Element(_tag("D", "principal-URL")))
-        prop200.append(ET.Element(_tag("D", "principal-collection-set")))
-        prop200.append(ET.Element(_tag("C", "calendar-user-address-set")))
-        prop200.append(ET.Element(_tag("CR", "addressbook-home-set")))
-        prop200.append(ET.Element(_tag("C", "calendar-home-set")))
-        prop200.append(ET.Element(
-            _tag("C", "supported-calendar-component-set")))
-        prop200.append(ET.Element(_tag("D", "current-user-privilege-set")))
-        prop200.append(ET.Element(_tag("D", "supported-report-set")))
-        prop200.append(ET.Element(_tag("D", "getcontenttype")))
-        prop200.append(ET.Element(_tag("D", "resourcetype")))
+        props.append(_tag("D", "principal-collection-set"))
+        props.append(_tag("D", "current-user-principal"))
+        props.append(_tag("D", "current-user-privilege-set"))
+        props.append(_tag("D", "supported-report-set"))
+        props.append(_tag("D", "resourcetype"))
+        props.append(_tag("D", "owner"))
+
+        if is_collection and collection.is_principal:
+            props.append(_tag("C", "calendar-user-address-set"))
+            props.append(_tag("D", "principal-URL"))
+            props.append(_tag("CR", "addressbook-home-set"))
+            props.append(_tag("C", "calendar-home-set"))
+
+        if not is_collection or is_leaf:
+            props.append(_tag("D", "getetag"))
+            props.append(_tag("D", "getlastmodified"))
+            props.append(_tag("D", "getcontenttype"))
+            props.append(_tag("D", "getcontentlength"))
 
         if is_collection:
-            prop200.append(ET.Element(_tag("CS", "getctag")))
-            prop200.append(ET.Element(_tag("D", "sync-token")))
-            prop200.append(ET.Element(_tag("C", "calendar-timezone")))
-            prop200.append(ET.Element(_tag("D", "displayname")))
-            prop200.append(ET.Element(_tag("ICAL", "calendar-color")))
-            prop200.append(ET.Element(_tag("D", "owner")))
-
             if is_leaf:
-                meta = item.get_meta()
-                for tag in meta:
-                    clark_tag = _tag_from_human(tag)
-                    if prop200.find(clark_tag) is None:
-                        prop200.append(ET.Element(clark_tag))
+                props.append(_tag("D", "displayname"))
+                props.append(_tag("D", "sync-token"))
+            if collection.get_meta("tag") == "VCALENDAR":
+                props.append(_tag("CS", "getctag"))
+                props.append(_tag("C", "supported-calendar-component-set"))
+
+            meta = item.get_meta()
+            for tag in meta:
+                if tag == "tag":
+                    continue
+                clark_tag = _tag_from_human(tag)
+                if clark_tag not in props:
+                    props.append(clark_tag)
+
+    if propname:
+        for tag in props:
+            prop200.append(ET.Element(tag))
+        props = ()
 
     for tag in props:
         element = ET.Element(tag)
         is404 = False
         if tag == _tag("D", "getetag"):
-            element.text = item.etag
+            if not is_collection or is_leaf:
+                element.text = item.etag
+            else:
+                is404 = True
         elif tag == _tag("D", "getlastmodified"):
-            element.text = item.last_modified
+            if not is_collection or is_leaf:
+                element.text = item.last_modified
+            else:
+                is404 = True
         elif tag == _tag("D", "principal-collection-set"):
             tag = ET.Element(_tag("D", "href"))
             tag.text = _href(base_prefix, "/")
@@ -875,9 +934,12 @@ def _propfind_response(base_prefix, path, item, props, user, write=False,
             else:
                 is404 = True
         elif tag == _tag("D", "current-user-principal"):
-            tag = ET.Element(_tag("D", "href"))
-            tag.text = _href(base_prefix, ("/%s/" % user) if user else "/")
-            element.append(tag)
+            if user:
+                tag = ET.Element(_tag("D", "href"))
+                tag.text = _href(base_prefix, "/%s/" % user)
+                element.append(tag)
+            else:
+                element.append(ET.Element(_tag("D", "unauthenticated")))
         elif tag == _tag("D", "current-user-privilege-set"):
             privileges = [("D", "read")]
             if write:
@@ -910,6 +972,18 @@ def _propfind_response(base_prefix, path, item, props, user, write=False,
                 report_tag.append(supported_report_tag)
                 supported.append(report_tag)
                 element.append(supported)
+        elif tag == _tag("D", "getcontentlength"):
+            if not is_collection or is_leaf:
+                encoding = collection.configuration.get("encoding", "request")
+                element.text = str(len(item.serialize().encode(encoding)))
+            else:
+                is404 = True
+        elif tag == _tag("D", "owner"):
+            # return empty elment, if no owner available (rfc3744-5.1)
+            if collection.owner:
+                tag = ET.Element(_tag("D", "href"))
+                tag.text = _href(base_prefix, "/%s/" % collection.owner)
+                element.append(tag)
         elif is_collection:
             if tag == _tag("D", "getcontenttype"):
                 if is_leaf:
@@ -929,15 +1003,19 @@ def _propfind_response(base_prefix, path, item, props, user, write=False,
                         element.append(tag)
                 tag = ET.Element(_tag("D", "collection"))
                 element.append(tag)
-            elif tag == _tag("D", "owner"):
-                # return empty elment, if no owner available (rfc3744-5.1)
-                if collection.owner:
-                    tag = ET.Element(_tag("D", "href"))
-                    tag.text = _href(base_prefix, "/%s/" % collection.owner)
-                    element.append(tag)
+            elif tag == _tag("RADICALE", "displayname"):
+                # Only for internal use by the web interface
+                displayname = item.get_meta("D:displayname")
+                if displayname is not None:
+                    element.text = displayname
+                else:
+                    is404 = True
             elif tag == _tag("D", "displayname"):
-                if is_leaf:
-                    element.text = item.get_meta("D:displayname") or item.path
+                displayname = item.get_meta("D:displayname")
+                if not displayname and is_leaf:
+                    displayname = item.path
+                if displayname is not None:
+                    element.text = displayname
                 else:
                     is404 = True
             elif tag == _tag("CS", "getctag"):
@@ -959,15 +1037,10 @@ def _propfind_response(base_prefix, path, item, props, user, write=False,
                     is404 = True
         # Not for collections
         elif tag == _tag("D", "getcontenttype"):
-            name = item.name.lower()
-            mimetype = "text/vcard" if name == "vcard" else "text/calendar"
-            element.text = "%s; component=%s" % (mimetype, name)
+            element.text = get_content_type(item)
         elif tag == _tag("D", "resourcetype"):
             # resourcetype must be returned empty for non-collection elements
             pass
-        elif tag == _tag("D", "getcontentlength"):
-            encoding = collection.configuration.get("encoding", "request")
-            element.text = str(len(item.serialize().encode(encoding)))
         else:
             is404 = True
 
@@ -1051,6 +1124,7 @@ def report(base_prefix, path, xml_request, collection):
     Read rfc3253-3.6 for info.
 
     """
+    logger = collection.logger
     multistatus = ET.Element(_tag("D", "multistatus"))
     if xml_request is None:
         return client.MULTI_STATUS, multistatus
@@ -1063,8 +1137,8 @@ def report(base_prefix, path, xml_request, collection):
         # properties, just return an empty result.
         # InfCloud asks for expand-property reports (even if we don't announce
         # support for them) and stops working if an error code is returned.
-        collection.logger.warning("Unsupported REPORT method %r on %r "
-                                  "requested", root.tag, path)
+        logger.warning("Unsupported REPORT method %r on %r requested",
+                       root.tag, path)
         return client.MULTI_STATUS, multistatus
     prop_element = root.find(_tag("D", "prop"))
     props = (
@@ -1082,21 +1156,20 @@ def report(base_prefix, path, xml_request, collection):
             if (href_path + "/").startswith(base_prefix + "/"):
                 hreferences.add(href_path[len(base_prefix):])
             else:
-                collection.logger.warning("Skipping invalid path %r in REPORT "
-                                          "request on %r", href_path, path)
+                logger.warning("Skipping invalid path %r in REPORT request on "
+                               "%r", href_path, path)
     elif root.tag == _tag("D", "sync-collection"):
         old_sync_token_element = root.find(_tag("D", "sync-token"))
         old_sync_token = ""
         if old_sync_token_element is not None and old_sync_token_element.text:
             old_sync_token = old_sync_token_element.text.strip()
-        collection.logger.debug("Client provided sync token: %r",
-                                old_sync_token)
+        logger.debug("Client provided sync token: %r", old_sync_token)
         try:
             sync_token, names = collection.sync(old_sync_token)
         except ValueError as e:
             # Invalid sync token
-            collection.logger.warning("Client provided invalid sync token %r: "
-                                      "%s", old_sync_token, e, exc_info=True)
+            logger.warning("Client provided invalid sync token %r: %s",
+                           old_sync_token, e, exc_info=True)
             return (client.PRECONDITION_FAILED,
                     _webdav_error("D", "valid-sync-token"))
         hreferences = ("/" + posixpath.join(collection.path, n) for n in names)
@@ -1126,9 +1199,8 @@ def report(base_prefix, path, xml_request, collection):
                 try:
                     name = name_from_path(hreference, collection)
                 except ValueError as e:
-                    collection.logger.warning(
-                        "Skipping invalid path %r in REPORT request on %r: %s",
-                        hreference, path, e)
+                    logger.warning("Skipping invalid path %r in REPORT request"
+                                   " on %r: %s", hreference, path, e)
                     response = _item_response(base_prefix, hreference,
                                               found_item=False)
                     multistatus.append(response)
@@ -1151,16 +1223,38 @@ def report(base_prefix, path, xml_request, collection):
         if collection_requested:
             yield from collection.get_all_filtered(filters)
 
+    def match(item, filter_):
+        tag = collection.get_meta("tag")
+        if (tag == "VCALENDAR" and filter_.tag != _tag("C", filter_)):
+            if len(filter_) == 0:
+                return True
+            if len(filter_) > 1:
+                raise ValueError("Filter with %d children" % len(filter_))
+            if filter_[0].tag != _tag("C", "comp-filter"):
+                raise ValueError("Unexpected %r in filter" % filter_[0].tag)
+            return _comp_match(item, filter_[0])
+        if tag == "VADDRESSBOOK" and filter_.tag != _tag("CR", filter_):
+            for child in filter_:
+                if child.tag != _tag("CR", "prop-filter"):
+                    raise ValueError("Unexpected %r in filter" % child.tag)
+            test = filter_.get("test", "anyof")
+            if test == "anyof":
+                return any(_prop_match(item.item, f, "CR") for f in filter_)
+            if test == "allof":
+                return all(_prop_match(item.item, f, "CR") for f in filter_)
+            raise ValueError("Unsupported filter test: %r" % test)
+            return all(_prop_match(item.item, f, "CR") for f in filter_)
+        raise ValueError("unsupported filter %r for %r" % (filter_.tag, tag))
+
     for item, filters_matched in retrieve_items(collection, hreferences,
                                                 multistatus):
         if filters and not filters_matched:
-            match = (
-                _comp_match if collection.get_meta("tag") == "VCALENDAR"
-                else _prop_match)
             try:
-                if not all(match(item, filter_[0]) for filter_ in filters
-                           if filter_):
+                if not all(match(item, filter_) for filter_ in filters):
                     continue
+            except ValueError as e:
+                raise ValueError("Failed to filter item %r from %r: %s" %
+                                 (item.href, collection.path, e)) from e
             except Exception as e:
                 raise RuntimeError("Failed to filter item %r from %r: %s" %
                                    (item.href, collection.path, e)) from e
@@ -1174,10 +1268,7 @@ def report(base_prefix, path, xml_request, collection):
                 element.text = item.etag
                 found_props.append(element)
             elif tag == _tag("D", "getcontenttype"):
-                name = item.name.lower()
-                mimetype = (
-                    "text/vcard" if name == "vcard" else "text/calendar")
-                element.text = "%s; component=%s" % (mimetype, name)
+                element.text = get_content_type(item)
                 found_props.append(element)
             elif tag in (
                     _tag("C", "calendar-data"),

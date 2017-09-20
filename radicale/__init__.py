@@ -52,7 +52,7 @@ import vobject
 
 from . import auth, rights, storage, web, xmlutils
 
-VERSION = "2.1.4"
+VERSION = "2.1.7"
 
 NOT_ALLOWED = (
     client.FORBIDDEN, (("Content-Type", "text/plain"),),
@@ -109,16 +109,24 @@ class HTTPServer(wsgiref.simple_server.WSGIServer):
             # Only allow IPv6 connections to the IPv6 socket
             self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
 
-        if bind_and_activate:
-            self.server_bind()
-            self.server_activate()
-
         if self.max_connections:
             self.connections_guard = threading.BoundedSemaphore(
                 self.max_connections)
         else:
             # use dummy context manager
             self.connections_guard = contextlib.ExitStack()
+
+        if bind_and_activate:
+            try:
+                self.server_bind()
+                self.server_activate()
+            except:
+                self.server_close()
+                raise
+
+        if self.client_timeout and sys.version_info < (3, 5, 2):
+            self.logger.warning("Using server.timeout with Python < 3.5.2 "
+                                "can cause network connection failures")
 
     def get_request(self):
         # Set timeout for client
@@ -247,10 +255,11 @@ class Application:
         # Mask passwords
         mask_passwords = self.configuration.getboolean(
             "logging", "mask_passwords")
-        authorization = request_environ.get(
-            "HTTP_AUTHORIZATION", "").startswith("Basic")
-        if mask_passwords and authorization:
+        authorization = request_environ.get("HTTP_AUTHORIZATION", "")
+        if mask_passwords and authorization.startswith("Basic"):
             request_environ["HTTP_AUTHORIZATION"] = "Basic **masked**"
+        if request_environ.get("HTTP_COOKIE"):
+            request_environ["HTTP_COOKIE"] = "**masked**"
 
         return request_environ
 
@@ -322,10 +331,11 @@ class Application:
             self.logger.error("An exception occurred during %s request on %r: "
                               "%s", method, path, e, exc_info=True)
             status, headers, answer = INTERNAL_SERVER_ERROR
+            answer = answer.encode("ascii")
             status = "%d %s" % (
                 status, client.responses.get(status, "Unknown"))
             headers = [("Content-Length", str(len(answer)))] + list(headers)
-            answers = [answer.encode("ascii")]
+            answers = [answer]
         start_response(status, headers)
         return answers
 
@@ -410,6 +420,10 @@ class Application:
         # Get function corresponding to method
         function = getattr(self, "do_%s" % environ["REQUEST_METHOD"].upper())
 
+        # If "/.well-known" is not available, clients query "/"
+        if path == "/.well-known" or path.startswith("/.well-known/"):
+            return response(*NOT_FOUND)
+
         # Ask authentication backend to check rights
         external_login = self.Auth.get_external_login(environ)
         authorization = environ.get("HTTP_AUTHORIZATION", "")
@@ -425,10 +439,6 @@ class Application:
             password = ""
         user = self.Auth.map_login_to_user(login)
 
-        # If "/.well-known" is not available, clients query "/"
-        if path == "/.well-known" or path.startswith("/.well-known/"):
-            return response(*NOT_FOUND)
-
         if not user:
             is_authenticated = True
         elif not storage.is_safe_path_component(user):
@@ -436,7 +446,8 @@ class Application:
             self.logger.info("Refused unsafe username: %r", user)
             is_authenticated = False
         else:
-            is_authenticated = self.Auth.is_authenticated(user, password)
+            is_authenticated = self.Auth.is_authenticated2(login, user,
+                                                           password)
             if not is_authenticated:
                 self.logger.info("Failed login attempt: %r", user)
                 # Random delay to avoid timing oracles and bruteforce attacks
@@ -597,14 +608,12 @@ class Application:
             if not item:
                 return NOT_FOUND
             if isinstance(item, storage.BaseCollection):
-                collection = item
-                if collection.get_meta("tag") not in (
-                        "VADDRESSBOOK", "VCALENDAR"):
+                tag = item.get_meta("tag")
+                if not tag:
                     return DIRECTORY_LISTING
+                content_type = xmlutils.MIMETYPES[tag]
             else:
-                collection = item.collection
-            content_type = xmlutils.MIMETYPES.get(
-                collection.get_meta("tag"), "text/plain")
+                content_type = xmlutils.OBJECT_MIMETYPES[item.name]
             headers = {
                 "Content-Type": content_type,
                 "Last-Modified": item.last_modified,
@@ -870,7 +879,18 @@ class Application:
                 return BAD_REQUEST
 
             if write_whole_collection:
-                props = {"tag": tag} if tag else {}
+                props = {}
+                if tag:
+                    props["tag"] = tag
+                if tag == "VCALENDAR" and items:
+                    if hasattr(items[0], "x_wr_calname"):
+                        calname = items[0].x_wr_calname.value
+                        if calname:
+                            props["D:displayname"] = calname
+                    if hasattr(items[0], "x_wr_caldesc"):
+                        caldesc = items[0].x_wr_caldesc.value
+                        if caldesc:
+                            props["C:calendar-description"] = caldesc
                 try:
                     storage.check_and_sanitize_props(props)
                     new_item = self.Collection.create_collection(
@@ -919,6 +939,11 @@ class Application:
             else:
                 collection = item.collection
             headers = {"Content-Type": "text/xml; charset=%s" % self.encoding}
-            status, xml_answer = xmlutils.report(
-                base_prefix, path, xml_content, collection)
+            try:
+                status, xml_answer = xmlutils.report(
+                    base_prefix, path, xml_content, collection)
+            except ValueError as e:
+                self.logger.warning(
+                    "Bad REPORT request on %r: %s", path, e, exc_info=True)
+                return BAD_REQUEST
             return (status, headers, self._write_xml_content(xml_answer))

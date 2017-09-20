@@ -93,23 +93,45 @@ class BaseAuth:
     def get_external_login(self, environ):
         """Optionally provide the login and password externally.
 
-        Returns a tuple (login, password) or ().
+        ``environ`` a dict with the WSGI environment
+
+        If ``()`` is returned, Radicale handles HTTP authentication.
+        Otherwise, returns a tuple ``(login, password)``. For anonymous users
+        ``login`` must be ``""``.
 
         """
         return ()
 
+    def is_authenticated2(self, login, user, password):
+        """Validate credentials.
+
+        ``login`` the login name
+
+        ``user`` the user from ``map_login_to_user(login)``.
+
+        ``password`` the login password
+
+        """
+        return self.is_authenticated(user, password)
+
     def is_authenticated(self, user, password):
         """Validate credentials.
 
-        Iterate through htpasswd credential file until user matches, extract
-        hash (encrypted password) and check hash against user-given password,
-        using the method specified in the Radicale config.
+        DEPRECATED: use ``is_authenticated2`` instead
 
         """
         raise NotImplementedError
 
     def map_login_to_user(self, login):
-        """Map login to internal username."""
+        """Map login name to internal user.
+
+        ``login`` the login name, ``""`` for anonymous users
+
+        Returns a string with the user name.
+        If a login can't be mapped to an user, return ``login`` and
+        return ``False`` in ``is_authenticated2(...)``.
+
+        """
         return login
 
 
@@ -170,16 +192,18 @@ class Auth(BaseAuth):
 
     def _crypt(self, crypt, hash_value, password):
         """Check if ``hash_value`` and ``password`` match, crypt method."""
+        hash_value = hash_value.strip()
         return hmac.compare_digest(crypt.crypt(password, hash_value),
                                    hash_value)
 
     def _sha1(self, hash_value, password):
         """Check if ``hash_value`` and ``password`` match, sha1 method."""
-        hash_value = hash_value.replace("{SHA}", "").encode("ascii")
+        hash_value = base64.b64decode(hash_value.strip().replace(
+            "{SHA}", "").encode("ascii"))
         password = password.encode(self.configuration.get("encoding", "stock"))
         sha1 = hashlib.sha1()
         sha1.update(password)
-        return hmac.compare_digest(sha1.digest(), base64.b64decode(hash_value))
+        return hmac.compare_digest(sha1.digest(), hash_value)
 
     def _ssha(self, hash_value, password):
         """Check if ``hash_value`` and ``password`` match, salted sha1 method.
@@ -188,7 +212,7 @@ class Auth(BaseAuth):
         written with e.g. openssl, and nginx can parse it.
 
         """
-        hash_value = base64.b64decode(hash_value.replace(
+        hash_value = base64.b64decode(hash_value.strip().replace(
             "{SSHA}", "").encode("ascii"))
         password = password.encode(self.configuration.get("encoding", "stock"))
         salt_value = hash_value[20:]
@@ -199,27 +223,37 @@ class Auth(BaseAuth):
         return hmac.compare_digest(sha1.digest(), hash_value)
 
     def _bcrypt(self, bcrypt, hash_value, password):
+        hash_value = hash_value.strip()
         return bcrypt.verify(password, hash_value)
 
     def _md5apr1(self, md5_apr1, hash_value, password):
+        hash_value = hash_value.strip()
         return md5_apr1.verify(password, hash_value)
 
     def is_authenticated(self, user, password):
-        # The content of the file is not cached because reading is generally a
-        # very cheap operation, and it's useful to get live updates of the
-        # htpasswd file.
+        """Validate credentials.
+
+        Iterate through htpasswd credential file until user matches, extract
+        hash (encrypted password) and check hash against user-given password,
+        using the method specified in the Radicale config.
+
+        The content of the file is not cached because reading is generally a
+        very cheap operation, and it's useful to get live updates of the
+        htpasswd file.
+
+        """
         try:
-            with open(self.filename) as fd:
-                for line in fd:
-                    line = line.strip()
-                    if line:
+            with open(self.filename) as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if line.lstrip() and not line.lstrip().startswith("#"):
                         try:
-                            login, hash_value = line.split(":")
+                            login, hash_value = line.split(":", maxsplit=1)
                             # Always compare both login and password to avoid
                             # timing attacks, see #591.
                             login_ok = hmac.compare_digest(login, user)
                             password_ok = self.verify(hash_value, password)
-                            if login_ok & password_ok:
+                            if login_ok and password_ok:
                                 return True
                         except ValueError as e:
                             raise RuntimeError("Invalid htpasswd file %r: %s" %

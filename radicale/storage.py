@@ -40,6 +40,7 @@ from contextlib import contextmanager
 from hashlib import md5
 from importlib import import_module
 from itertools import chain, groupby
+from math import log
 from random import getrandbits
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
@@ -308,6 +309,11 @@ def path_to_filesystem(root, *paths):
     return safe_path
 
 
+def left_encode_int(v):
+    length = int(log(v, 256)) + 1 if v != 0 else 1
+    return bytes((length,)) + v.to_bytes(length, 'little')
+
+
 class UnsafePathError(ValueError):
     def __init__(self, path):
         message = "Can't translate name safely to filesystem: %r" % path
@@ -334,7 +340,8 @@ class ComponentNotFoundError(ValueError):
 
 class Item:
     def __init__(self, collection, item=None, href=None, last_modified=None,
-                 text=None, etag=None, uid=None):
+                 text=None, etag=None, uid=None, name=None,
+                 component_name=None):
         """Initialize an item.
 
         ``collection`` the parent collection.
@@ -362,6 +369,8 @@ class Item:
         self._item = item
         self._etag = etag
         self._uid = uid
+        self._name = name
+        self._component_name = component_name
 
     def __getattr__(self, attr):
         return getattr(self.item, attr)
@@ -397,6 +406,18 @@ class Item:
         if self._uid is None:
             self._uid = get_uid_from_object(self.item)
         return self._uid
+
+    @property
+    def name(self):
+        if self._name is not None:
+            return self._name
+        return self.item.name
+
+    @property
+    def component_name(self):
+        if self._component_name is not None:
+            return self._component_name
+        return xmlutils.find_tag(self.item)
 
 
 class BaseCollection:
@@ -656,32 +677,38 @@ class BaseCollection:
                         if depth == 1 and line.startswith("END:"):
                             in_vcalendar = False
                         if depth == 2 and line == "BEGIN:VTIMEZONE":
-                            vtimezone.append(line)
+                            vtimezone.append(line + "\r\n")
                         elif vtimezone:
-                            vtimezone.append(line)
+                            vtimezone.append(line + "\r\n")
                             if depth == 2 and line.startswith("TZID:"):
                                 tzid = line[len("TZID:"):]
                             elif depth == 2 and line.startswith("END:"):
                                 if tzid is None or tzid not in included_tzids:
-                                    if vtimezones:
-                                        vtimezones += "\r\n"
-                                    vtimezones += "\r\n".join(vtimezone)
+                                    vtimezones += "".join(vtimezone)
                                     included_tzids.add(tzid)
                                 vtimezone.clear()
                                 tzid = None
                         elif depth >= 2:
-                            if components:
-                                components += "\r\n"
-                            components += line
+                            components += line + "\r\n"
                     if line.startswith("END:"):
                         depth -= 1
-            return "\r\n".join(filter(bool, (
-                "BEGIN:VCALENDAR",
-                "VERSION:2.0",
-                "PRODID:-//PYVOBJECT//NONSGML Version 1//EN",
-                vtimezones,
-                components,
-                "END:VCALENDAR")))
+            template = vobject.iCalendar()
+            displayname = self.get_meta("D:displayname")
+            if displayname:
+                template.add("X-WR-CALNAME")
+                template.x_wr_calname.value_param = "TEXT"
+                template.x_wr_calname.value = displayname
+            description = self.get_meta("C:calendar-description")
+            if description:
+                template.add("X-WR-CALDESC")
+                template.x_wr_caldesc.value_param = "TEXT"
+                template.x_wr_caldesc.value = description
+            template = template.serialize()
+            template_insert_pos = template.find("\r\nEND:VCALENDAR\r\n") + 2
+            assert template_insert_pos != -1
+            return (template[:template_insert_pos] +
+                    vtimezones + components +
+                    template[template_insert_pos:])
         elif self.get_meta("tag") == "VADDRESSBOOK":
             return "".join((item.serialize() for item in self.get_all()))
         return ""
@@ -698,6 +725,14 @@ class BaseCollection:
 
         """
         raise NotImplementedError
+
+    @classmethod
+    def verify(cls):
+        """Check the storage for errors."""
+        return True
+
+
+ITEM_CACHE_VERSION = 1
 
 
 class Collection(BaseCollection):
@@ -807,12 +842,11 @@ class Collection(BaseCollection):
         cls._sync_directory(parent_filesystem_path)
 
     @classmethod
-    def discover(cls, path, depth="0"):
+    def discover(cls, path, depth="0", child_context_manager=(
+                 lambda path, href=None: contextlib.ExitStack())):
         # Path should already be sanitized
         sane_path = sanitize_path(path).strip("/")
-        attributes = sane_path.split("/")
-        if not attributes[0]:
-            attributes.pop()
+        attributes = sane_path.split("/") if sane_path else []
 
         folder = cls._get_collection_root_folder()
         # Create the root collection
@@ -846,8 +880,9 @@ class Collection(BaseCollection):
         if depth == "0":
             return
 
-        for item in collection.list():
-            yield collection.get(item)
+        for href in collection.list():
+            with child_context_manager(sane_path, href):
+                yield collection.get(href)
 
         for href in scandir(filesystem_path, only_dirs=True):
             if not is_safe_filesystem_path_component(href):
@@ -856,7 +891,47 @@ class Collection(BaseCollection):
                                      sane_path)
                 continue
             child_path = posixpath.join(sane_path, href)
-            yield cls(child_path)
+            with child_context_manager(child_path):
+                yield cls(child_path)
+
+    @classmethod
+    def verify(cls):
+        item_errors = collection_errors = 0
+
+        @contextlib.contextmanager
+        def exception_cm(path, href=None):
+            nonlocal item_errors, collection_errors
+            try:
+                yield
+            except Exception as e:
+                if href:
+                    item_errors += 1
+                    name = "item %r in %r" % (href, path.strip("/"))
+                else:
+                    collection_errors += 1
+                    name = "collection %r" % path.strip("/")
+                cls.logger.error("Invalid %s: %s", name, e, exc_info=True)
+
+        remaining_paths = [""]
+        while remaining_paths:
+            path = remaining_paths.pop(0)
+            cls.logger.debug("Verifying collection %r", path)
+            with exception_cm(path):
+                saved_item_errors = item_errors
+                collection = None
+                for item in cls.discover(path, "1", exception_cm):
+                    if not collection:
+                        collection = item
+                        collection.get_meta()
+                        continue
+                    if isinstance(item, BaseCollection):
+                        remaining_paths.append(item.path)
+                    else:
+                        cls.logger.debug("Verified item %r in %r",
+                                         item.href, path)
+                if item_errors == saved_item_errors:
+                    collection.sync()
+        return item_errors == 0 and collection_errors == 0
 
     @classmethod
     def create_collection(cls, href, collection=None, props=None):
@@ -940,7 +1015,7 @@ class Collection(BaseCollection):
                 raise UnsafePathError(href)
             try:
                 cache_content = self._item_cache_content(href, vobject_item)
-                _, _, _, text, _, _, _ = cache_content
+                _, _, _, text, _, _, _, _ = cache_content
             except Exception as e:
                 raise ValueError(
                     "Failed to store item %r in temporary collection %r: %s" %
@@ -1181,6 +1256,7 @@ class Collection(BaseCollection):
 
     def _item_cache_hash(self, raw_text):
         _hash = md5()
+        _hash.update(left_encode_int(ITEM_CACHE_VERSION))
         _hash.update(raw_text)
         return _hash.hexdigest()
 
@@ -1190,8 +1266,9 @@ class Collection(BaseCollection):
             cache_hash = self._item_cache_hash(text.encode(self._encoding))
         etag = get_etag(text)
         uid = get_uid_from_object(vobject_item)
+        name = vobject_item.name
         tag, start, end = xmlutils.find_tag_and_time_range(vobject_item)
-        return cache_hash, uid, etag, text, tag, start, end
+        return cache_hash, uid, etag, text, name, tag, start, end
 
     def _store_item_cache(self, href, vobject_item, cache_hash=None):
         cache_folder = os.path.join(self._filesystem_path, ".Radicale.cache",
@@ -1240,20 +1317,22 @@ class Collection(BaseCollection):
                     if not lock.in_use():
                         del self._cache_locks[lock_id]
 
-    def _load_item_cache(self, href):
+    def _load_item_cache(self, href, input_hash):
         cache_folder = os.path.join(self._filesystem_path, ".Radicale.cache",
                                     "item")
-        cache_hash = uid = etag = text = tag = start = end = None
+        cache_hash = uid = etag = text = name = tag = start = end = None
         try:
             with open(os.path.join(cache_folder, href), "rb") as f:
-                cache_hash, uid, etag, text, tag, start, end = pickle.load(f)
+                cache_hash, *content = pickle.load(f)
+                if cache_hash == input_hash:
+                    uid, etag, text, name, tag, start, end = content
         except FileNotFoundError as e:
             pass
         except (pickle.UnpicklingError, ValueError) as e:
             self.logger.warning(
                 "Failed to load item cache entry %r in %r: %s",
                 href, self.path, e, exc_info=True)
-        return cache_hash, uid, etag, text, tag, start, end
+        return cache_hash, uid, etag, text, name, tag, start, end
 
     def _clean_item_cache(self):
         cache_folder = os.path.join(self._filesystem_path, ".Radicale.cache",
@@ -1286,8 +1365,8 @@ class Collection(BaseCollection):
         # The hash of the component in the file system. This is used to check,
         # if the entry in the cache is still valid.
         input_hash = self._item_cache_hash(raw_text)
-        cache_hash, uid, etag, text, tag, start, end = self._load_item_cache(
-            href)
+        cache_hash, uid, etag, text, name, tag, start, end = \
+            self._load_item_cache(href, input_hash)
         vobject_item = None
         if input_hash != cache_hash:
             with contextlib.ExitStack() as lock_stack:
@@ -1297,8 +1376,8 @@ class Collection(BaseCollection):
                 if self._lock.locked() == "r":
                     lock_stack.enter_context(self._acquire_cache_lock("item"))
                     # Check if another process created the file in the meantime
-                    cache_hash, uid, etag, text, tag, start, end = \
-                        self._load_item_cache(href)
+                    cache_hash, uid, etag, text, name, tag, start, end = \
+                        self._load_item_cache(href, input_hash)
                 if input_hash != cache_hash:
                     try:
                         vobject_items = tuple(vobject.readComponents(
@@ -1309,7 +1388,7 @@ class Collection(BaseCollection):
                         vobject_item = vobject_items[0]
                         check_and_sanitize_item(vobject_item, uid=uid,
                                                 tag=self.get_meta("tag"))
-                        cache_hash, uid, etag, text, tag, start, end = \
+                        cache_hash, uid, etag, text, name, tag, start, end = \
                             self._store_item_cache(
                                 href, vobject_item, input_hash)
                     except Exception as e:
@@ -1325,7 +1404,8 @@ class Collection(BaseCollection):
             time.gmtime(os.path.getmtime(path)))
         return Item(
             self, href=href, last_modified=last_modified, etag=etag,
-            text=text, item=vobject_item, uid=uid), (tag, start, end)
+            text=text, item=vobject_item, uid=uid, name=name,
+            component_name=tag), (tag, start, end)
 
     def get_multi2(self, hrefs):
         # It's faster to check for file name collissions here, because
@@ -1351,7 +1431,8 @@ class Collection(BaseCollection):
         return (self.get(href, verify_href=False) for href in self.list())
 
     def get_all_filtered(self, filters):
-        tag, start, end, simple = xmlutils.simplify_prefilters(filters)
+        tag, start, end, simple = xmlutils.simplify_prefilters(
+            filters, collection_tag=self.get_meta("tag"))
         if not tag:
             # no filter
             yield from ((item, simple) for item in self.get_all())
@@ -1366,8 +1447,8 @@ class Collection(BaseCollection):
         if not is_safe_filesystem_path_component(href):
             raise UnsafePathError(href)
         try:
-            cache_hash, uid, etag, text, _, _, _ = self._store_item_cache(
-                href, vobject_item)
+            cache_hash, uid, etag, text, name, tag, _, _ = \
+                self._store_item_cache(href, vobject_item)
         except Exception as e:
             raise ValueError("Failed to store item %r in collection %r: %s" %
                              (href, self.path, e)) from e
@@ -1378,7 +1459,7 @@ class Collection(BaseCollection):
         # will be removed again.
         self._clean_item_cache()
         item = Item(self, href=href, etag=etag, text=text, item=vobject_item,
-                    uid=uid)
+                    uid=uid, name=name, component_name=tag)
         # Track the change
         self._update_history_etag(href, item)
         self._clean_history_cache()

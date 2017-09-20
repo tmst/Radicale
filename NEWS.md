@@ -1,12 +1,58 @@
 News
 ====
 
+2.1.7 - Wild Radish
+-------------------
+
+This release is compatible with version 2.0.0.
+
+* Don't print warning when cache format changes
+* Add documentation for ``BaseAuth``
+* Add ``is_authenticated2(login, user, password)`` to ``BaseAuth``
+* Fix names of custom properties in PROPFIND requests with
+  ``D:propname`` or ``D:allprop``
+* Return all properties in PROPFIND requests with ``D:propname`` or
+  ``D:allprop``
+* Allow ``D:displayname`` property on all collections
+* Answer with ``D:unauthenticated`` for ``D:current-user-principal`` property
+  when not logged in
+* Remove non-existing ``ICAL:calendar-color`` and ``C:calendar-timezone``
+  properties from PROPFIND requests with ``D:propname`` or ``D:allprop``
+* Add ``D:owner`` property to calendar and address book objects
+* Remove ``D:getetag`` and ``D:getlastmodified`` properties from regular
+  collections
+
+
+2.1.6 - Wild Radish
+-------------------
+
+This release is compatible with version 2.0.0.
+
+* Fix content-type of VLIST
+* Specify correct COMPONENT in content-type of VCALENDAR
+* Cache COMPONENT of calendar objects (improves speed with some clients)
+* Stricter parsing of filters
+* Improve support for CardDAV filter
+* Fix some smaller bugs in CalDAV filter
+* Add X-WR-CALNAME and X-WR-CALDESC to calendars downloaded via HTTP/WebDAV
+* Use X-WR-CALNAME and X-WR-CALDESC from calendars published via WebDAV
+
+2.1.5 - Wild Radish
+-------------------
+
+This release is compatible with version 2.0.0.
+
+* Add ``--verify-storage`` command-line argument
+* Allow comments in the htpasswd file
+* Don't strip whitespaces from user names and passwords in the htpasswd file
+* Remove cookies from logging output
+* Allow uploads of whole collections with many components
+* Show warning message if server.timeout is used with Python < 3.5.2
+
 2.1.4 - Wild Radish
 -------------------
 
-This feature is not compatible with the 1.x.x versions. See
-http://radicale.org/1to2/ if you want to switch from 1.x.x to
-2.x.x.
+This release is compatible with version 2.0.0.
 
 * Fix incorrect time range matching and calculation for some edge-cases with
   rescheduled recurrences
@@ -15,9 +61,7 @@ http://radicale.org/1to2/ if you want to switch from 1.x.x to
 2.1.3 - Wild Radish
 -------------------
 
-This feature is not compatible with the 1.x.x versions. See
-http://radicale.org/1to2/ if you want to switch from 1.x.x to
-2.x.x.
+This release is compatible with version 2.0.0.
 
 * Enable timeout for SSL handshakes and move them out of the main thread
 * Create cache entries during upload of items
@@ -27,9 +71,7 @@ http://radicale.org/1to2/ if you want to switch from 1.x.x to
 2.1.2 - Wild Radish
 -------------------
 
-This feature is not compatible with the 1.x.x versions. See
-http://radicale.org/1to2/ if you want to switch from 1.x.x to
-2.x.x.
+This release is compatible with version 2.0.0.
 
 * Remove workarounds for bugs in VObject < 0.9.5
 * Error checking of collection tags and associated components

@@ -25,6 +25,7 @@ import posixpath
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
+from functools import partial
 
 import pytest
 
@@ -63,6 +64,7 @@ class BaseRequestsMixIn:
         status, headers, answer = self.request("GET", path)
         assert status == 200
         assert "ETag" in headers
+        assert headers["Content-Type"] == "text/calendar; charset=utf-8"
         assert "VEVENT" in answer
         assert "Event" in answer
         assert "UID:event" in answer
@@ -102,6 +104,7 @@ class BaseRequestsMixIn:
         status, headers, answer = self.request("GET", path)
         assert status == 200
         assert "ETag" in headers
+        assert headers["Content-Type"] == "text/calendar; charset=utf-8"
         assert "VTODO" in answer
         assert "Todo" in answer
         assert "UID:todo" in answer
@@ -132,6 +135,7 @@ class BaseRequestsMixIn:
         status, headers, answer = self.request("GET", path)
         assert status == 200
         assert "ETag" in headers
+        assert headers["Content-Type"] == "text/vcard; charset=utf-8"
         assert "VCARD" in answer
         assert "UID:contact1" in answer
         status, _, answer = self.request("GET", path)
@@ -366,6 +370,34 @@ class BaseRequestsMixIn:
         assert "href>%s</" % calendar_path in answer
         assert "href>%s</" % event_path in answer
 
+    def test_propfind_propname(self):
+        status, _, _ = self.request("MKCALENDAR", "/calendar.ics/")
+        assert status == 201
+        event = get_file_content("event1.ics")
+        status, _, _ = self.request("PUT", "/calendar.ics/event.ics", event)
+        assert status == 201
+        propfind = get_file_content("propname.xml")
+        status, _, answer = self.request(
+            "PROPFIND", "/calendar.ics/", propfind)
+        assert "<sync-token />" in answer
+        status, _, answer = self.request(
+            "PROPFIND", "/calendar.ics/event.ics", propfind)
+        assert "<getetag />" in answer
+
+    def test_propfind_allprop(self):
+        status, _, _ = self.request("MKCALENDAR", "/calendar.ics/")
+        assert status == 201
+        event = get_file_content("event1.ics")
+        status, _, _ = self.request("PUT", "/calendar.ics/event.ics", event)
+        assert status == 201
+        propfind = get_file_content("allprop.xml")
+        status, _, answer = self.request(
+            "PROPFIND", "/calendar.ics/", propfind)
+        assert "<sync-token>" in answer
+        status, _, answer = self.request(
+            "PROPFIND", "/calendar.ics/event.ics", propfind)
+        assert "<getetag>" in answer
+
     def test_proppatch(self):
         """Write a property and read it back."""
         status, _, _ = self.request("MKCALENDAR", "/calendar.ics/")
@@ -381,8 +413,12 @@ class BaseRequestsMixIn:
         status, _, answer = self.request(
             "PROPFIND", "/calendar.ics/", propfind)
         assert status == 207
-        assert ":calendar-color>#BADA55</" in answer
+        assert "<ICAL:calendar-color>#BADA55</" in answer
         assert "200 OK</status" in answer
+        propfind = get_file_content("allprop.xml")
+        status, _, answer = self.request(
+            "PROPFIND", "/calendar.ics/", propfind)
+        assert "<ICAL:calendar-color>" in answer
 
     def test_put_whole_calendar_multiple_events_with_same_uid(self):
         """Add two events with the same UID."""
@@ -401,30 +437,161 @@ class BaseRequestsMixIn:
         assert status == 200
         assert answer.count("BEGIN:VEVENT") == 2
 
-    def _test_filter(self, filters, kind="event", items=(1,)):
-        filters_text = "".join(
-            "<C:filter>%s</C:filter>" % filter_ for filter_ in filters)
-        status, _, _ = self.request("DELETE", "/calendar.ics/")
+    def _test_filter(self, filters, kind="event", test=None, items=(1,)):
+        filter_template = "<C:filter>{}</C:filter>"
+        if kind in ("event", "journal", "todo"):
+            create_collection_fn = partial(self.request, "MKCALENDAR")
+            path = "/calendar.ics/"
+            filename_template = "{}{}.ics"
+            namespace = "urn:ietf:params:xml:ns:caldav"
+            report = "calendar-query"
+        elif kind == "contact":
+            create_collection_fn = self._create_addressbook
+            if test:
+                filter_template = '<C:filter test="{}">{{}}</C:filter>'.format(
+                    test)
+            path = "/contacts.vcf/"
+            filename_template = "{}{}.vcf"
+            namespace = "urn:ietf:params:xml:ns:carddav"
+            report = "addressbook-query"
+        else:
+            raise ValueError("Unsupported kind: %r" % kind)
+        status, _, _ = self.request("DELETE", path)
         assert status in (200, 404)
-        status, _, _ = self.request("MKCALENDAR", "/calendar.ics/")
+        status, _, _ = create_collection_fn(path)
         assert status == 201
         for i in items:
-            filename = "{}{}.ics".format(kind, i)
+            filename = filename_template.format(kind, i)
             event = get_file_content(filename)
             status, _, _ = self.request(
-                "PUT", "/calendar.ics/%s" % filename, event)
+                "PUT", posixpath.join(path, filename), event)
             assert status == 201
+        filters_text = "".join(
+            filter_template.format(filter_) for filter_ in filters)
         status, _, answer = self.request(
-            "REPORT", "/calendar.ics",
+            "REPORT", path,
             """<?xml version="1.0" encoding="utf-8" ?>
-               <C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+               <C:{1} xmlns:C="{0}">
                  <D:prop xmlns:D="DAV:">
                    <D:getetag/>
                  </D:prop>
-                 %s
-               </C:calendar-query>""" % filters_text)
+                 {2}
+               </C:{1}>""".format(namespace, report, filters_text))
         assert status == 207
         return answer
+
+    def test_addressbook_empty_filter(self):
+        self._test_filter([""], kind="contact")
+
+    def test_addressbook_prop_filter(self):
+        assert "href>/contacts.vcf/contact1.vcf</" in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+                            match-type="contains"
+              >es</C:text-match>
+            </C:prop-filter>"""], "contact")
+        assert "href>/contacts.vcf/contact1.vcf</" in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+              >es</C:text-match>
+            </C:prop-filter>"""], "contact")
+        assert "href>/contacts.vcf/contact1.vcf</" not in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+                            match-type="contains"
+              >a</C:text-match>
+            </C:prop-filter>"""], "contact")
+        assert "href>/contacts.vcf/contact1.vcf</" in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+                            match-type="equals"
+              >test</C:text-match>
+            </C:prop-filter>"""], "contact")
+        assert "href>/contacts.vcf/contact1.vcf</" not in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+                            match-type="equals"
+              >tes</C:text-match>
+            </C:prop-filter>"""], "contact")
+        assert "href>/contacts.vcf/contact1.vcf</" not in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+                            match-type="equals"
+              >est</C:text-match>
+            </C:prop-filter>"""], "contact")
+        assert "href>/contacts.vcf/contact1.vcf</" in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+                            match-type="starts-with"
+              >tes</C:text-match>
+            </C:prop-filter>"""], "contact")
+        assert "href>/contacts.vcf/contact1.vcf</" not in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+                            match-type="starts-with"
+              >est</C:text-match>
+            </C:prop-filter>"""], "contact")
+        assert "href>/contacts.vcf/contact1.vcf</" in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+                            match-type="ends-with"
+              >est</C:text-match>
+            </C:prop-filter>"""], "contact")
+        assert "href>/contacts.vcf/contact1.vcf</" not in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+                            match-type="ends-with"
+              >tes</C:text-match>
+            </C:prop-filter>"""], "contact")
+
+    def test_addressbook_prop_filter_any(self):
+        assert "href>/contacts.vcf/contact1.vcf</" in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+              >test</C:text-match>
+            </C:prop-filter>
+            <C:prop-filter name="EMAIL">
+              <C:text-match collation="i;unicode-casemap"
+              >test</C:text-match>
+            </C:prop-filter>"""], "contact", test="anyof")
+        assert "href>/contacts.vcf/contact1.vcf</" not in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+              >a</C:text-match>
+            </C:prop-filter>
+            <C:prop-filter name="EMAIL">
+              <C:text-match collation="i;unicode-casemap"
+              >test</C:text-match>
+            </C:prop-filter>"""], "contact", test="anyof")
+        assert "href>/contacts.vcf/contact1.vcf</" in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+              >test</C:text-match>
+            </C:prop-filter>
+            <C:prop-filter name="EMAIL">
+              <C:text-match collation="i;unicode-casemap"
+              >test</C:text-match>
+            </C:prop-filter>"""], "contact")
+
+    def test_addressbook_prop_filter_all(self):
+        assert "href>/contacts.vcf/contact1.vcf</" in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+              >tes</C:text-match>
+            </C:prop-filter>
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+              >est</C:text-match>
+            </C:prop-filter>"""], "contact", test="allof")
+        assert "href>/contacts.vcf/contact1.vcf</" not in self._test_filter(["""
+            <C:prop-filter name="NICKNAME">
+              <C:text-match collation="i;unicode-casemap"
+              >test</C:text-match>
+            </C:prop-filter>
+            <C:prop-filter name="EMAIL">
+              <C:text-match collation="i;unicode-casemap"
+              >test</C:text-match>
+            </C:prop-filter>"""], "contact", test="allof")
 
     def test_calendar_empty_filter(self):
         self._test_filter([""])
@@ -627,6 +794,13 @@ class BaseRequestsMixIn:
         assert "href>/calendar.ics/event3.ics</" in answer
         assert "href>/calendar.ics/event4.ics</" in answer
         assert "href>/calendar.ics/event5.ics</" in answer
+        answer = self._test_filter(["""
+            <C:comp-filter name="VCALENDAR">
+              <C:comp-filter name="VTODO">
+                <C:time-range start="20130801T000000Z" end="20131001T000000Z"/>
+              </C:comp-filter>
+            </C:comp-filter>"""], "event", items=range(1, 6))
+        assert "href>/calendar.ics/event1.ics</" not in answer
         answer = self._test_filter(["""
             <C:comp-filter name="VCALENDAR">
               <C:comp-filter name="VEVENT">
@@ -1136,6 +1310,44 @@ class BaseRequestsMixIn:
         new_sync_token, xml = self._report_sync_token(calendar_path,
                                                       sync_token)
         assert sync_token == new_sync_token
+
+    def test_calendar_getcontenttype(self):
+        """Test report request on an item"""
+        status, _, _ = self.request("MKCALENDAR", "/test/")
+        assert status == 201
+        for component in ("event", "todo", "journal"):
+            event = get_file_content("{}1.ics".format(component))
+            status, _, _ = self.request("PUT", "/test/test.ics", event)
+            assert status == 201
+            status, _, answer = self.request(
+                "REPORT", "/test/",
+                """<?xml version="1.0" encoding="utf-8" ?>
+                   <C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+                     <D:prop xmlns:D="DAV:">
+                       <D:getcontenttype />
+                     </D:prop>
+                   </C:calendar-query>""")
+            assert status == 207
+            assert ">text/calendar;charset=utf-8;component=V{}<".format(
+                component.upper()) in answer
+
+    def test_addressbook_getcontenttype(self):
+        """Test report request on an item"""
+        status, _, _ = self._create_addressbook("/test/")
+        assert status == 201
+        contact = get_file_content("contact1.vcf")
+        status, _, _ = self.request("PUT", "/test/test.vcf", contact)
+        assert status == 201
+        status, _, answer = self.request(
+            "REPORT", "/test/",
+            """<?xml version="1.0" encoding="utf-8" ?>
+               <C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+                 <D:prop xmlns:D="DAV:">
+                   <D:getcontenttype />
+                 </D:prop>
+               </C:calendar-query>""")
+        assert status == 207
+        assert ">text/vcard;charset=utf-8<" in answer
 
     def test_authorization(self):
         authorization = "Basic " + base64.b64encode(b"user:").decode()
